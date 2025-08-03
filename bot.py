@@ -15,7 +15,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-TOKEN = "8357040231:AAHMHvKZIWSiqsHCIuguJsJB-MzKsJmWaQg"
+TOKEN = "8357040231:AAEiTt3fYdDzlP7APdzIVxjRwLa4hnoOgQM"
 CHAT_ID = "687892495"
 
 # متغيرات مراقبة
@@ -110,3 +110,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
+
