@@ -1,113 +1,115 @@
-import asyncio
+import json
 import logging
 import requests
-import nest_asyncio
+import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-
-# تطبيق fix لبيئات مثل VS Code
-nest_asyncio.apply()
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-logger = logging.getLogger(__name__)
+with open("bot_config.json", "r", encoding="utf-8") as f:
+    config = json.load(f)
 
-TOKEN = "8357040231:AAEiTt3fYdDzlP7APdzIVxjRwLa4hnoOgQM"
-CHAT_ID = "687892495"
+TELEGRAM_TOKEN = config["TELEGRAM_TOKEN"]
+CHAT_ID = config["CHAT_ID"]
 
-# متغيرات مراقبة
-known_coin_ids = set()
+notified_coins = set()
+scheduler = AsyncIOScheduler()
+app = None
+muted = False
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("أهلاً! البوت بدأ المراقبة.")
+async def send_notification(message):
+    global muted
+    if muted:
+        logging.info("🔕 التنبيهات موقوفة، لن يتم الإرسال.")
+        return
+    try:
+        await app.bot.send_message(chat_id=CHAT_ID, text=message)
+    except Exception as e:
+        logging.error(f"فشل في إرسال الرسالة: {e}")
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("الأوامر:\n/start - بدء البوت\n/help - المساعدة")
-
-def fetch_coins_list():
-    url = "https://api.coingecko.com/api/v3/coins/list"
-    response = requests.get(url)
-    response.raise_for_status()
-    return response.json()
-
-def fetch_coin_data():
+def check_crypto():
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
         "vs_currency": "usd",
-        "order": "market_cap_desc",
+        "order": "volume_desc",
         "per_page": 100,
         "page": 1,
-        "sparkline": False,
-        "price_change_percentage": "1h,24h,7d"
+        "sparkline": False
     }
-    response = requests.get(url, params=params)
-    response.raise_for_status()
-    return response.json()
-
-async def monitor(app):
-    global known_coin_ids
     try:
-        coins_list = fetch_coins_list()
-        known_coin_ids = set(coin['id'] for coin in coins_list)
-        logger.info(f"تم جلب قائمة {len(known_coin_ids)} عملة.")
+        response = requests.get(url, params=params)
+        data = response.json()
+        for coin in data:
+            if not coin.get("market_cap") or coin["market_cap"] < 1_000_000:
+                continue
+
+            coin_id = coin["id"]
+            if coin_id in notified_coins:
+                continue
+
+            name = coin["name"]
+            symbol = coin["symbol"].upper()
+            price = coin["current_price"]
+            market_cap = coin["market_cap"]
+            volume = coin["total_volume"]
+            change = coin["price_change_percentage_24h"]
+
+            message = (
+                f"🚨 عملة جديدة ظهرت في السوق!\n\n"
+                f"💰 الاسم: {name} ({symbol})\n"
+                f"📊 السعر: ${price:,.6f}\n"
+                f"💸 القيمة السوقية: ${market_cap:,.0f}\n"
+                f"📈 الحجم خلال 24 ساعة: ${volume:,.0f}\n"
+                f"📉 التغيير 24 ساعة: {change:.2f}%\n"
+                f"🌐 المنصة: CoinGecko"
+            )
+
+            asyncio.run_coroutine_threadsafe(send_notification(message), app.loop)
+            notified_coins.add(coin_id)
+
     except Exception as e:
-        logger.error(f"خطأ بجلب قائمة العملات: {e}")
-        return
+        logging.error(f"حدث خطأ أثناء جلب البيانات: {e}")
 
-    while True:
-        try:
-            data = fetch_coin_data()
-            logger.info(f"تم جلب بيانات {len(data)} عملة في الجولة الحالية.")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 بوت مراقبة العملات شغّال!")
 
-            # تحقق من عملات جديدة
-            new_coins = []
-            for coin in data:
-                if coin['id'] not in known_coin_ids:
-                    new_coins.append(coin)
-                    known_coin_ids.add(coin['id'])
+async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global muted
+    muted = True
+    await update.message.reply_text("🔕 تم إيقاف التنبيهات. استخدم /unmute لتفعيلها.")
 
-            if new_coins:
-                for coin in new_coins:
-                    text = (f"🚀 عملة جديدة على السوق:\n"
-                            f"اسم: {coin['name']} ({coin['symbol'].upper()})\n"
-                            f"السعر: ${coin['current_price']}\n"
-                            f"القيمة السوقية: ${coin['market_cap']:,}")
-                    await app.bot.send_message(chat_id=CHAT_ID, text=text)
-            else:
-                logger.info("لا توجد عملات جديدة في الجولة الحالية.")
+async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global muted
+    muted = False
+    await update.message.reply_text("🔔 تم تفعيل التنبيهات.")
 
-            # تحقق عملات ضاربة (مثال: زيادة سعر 10% بالساعة الماضية)
-            hot_coins = [c for c in data if c.get("price_change_percentage_1h_in_currency") and c["price_change_percentage_1h_in_currency"] > 10]
-            for coin in hot_coins:
-                text = (f"🔥 عملة ضاربة:\n"
-                        f"اسم: {coin['name']} ({coin['symbol'].upper()})\n"
-                        f"زيادة 1 ساعة: {coin['price_change_percentage_1h_in_currency']:.2f}%\n"
-                        f"السعر: ${coin['current_price']}\n"
-                        f"القيمة السوقية: ${coin['market_cap']:,}")
-                await app.bot.send_message(chat_id=CHAT_ID, text=text)
+async def start_scheduler():
+    if not scheduler.running:
+        scheduler.add_job(check_crypto, "interval", minutes=1)
+        scheduler.start()
+        logging.info("✅ الجدولة شغّالة...")
 
-        except requests.exceptions.HTTPError as http_err:
-            logger.error(f"HTTP error: {http_err}")
-        except Exception as e:
-            logger.error(f"خطأ أثناء المراقبة: {e}")
-
-        logger.info("انتظار 60 ثانية قبل الجولة القادمة...")
-        await asyncio.sleep(60)  # تأخير 60 ثانية لتجنب حظر API
-
-async def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-
+def main():
+    global app
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("mute", mute))
+    app.add_handler(CommandHandler("unmute", unmute))
 
-    # ابدأ المراقبة بشكل غير متزامن (background)
-    asyncio.create_task(monitor(app))
+    loop = asyncio.get_event_loop()
 
-    await app.run_polling()
+    loop.create_task(start_scheduler())
+    loop.create_task(app.run_polling())
+
+    try:
+        loop.run_forever()
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("بوت توقف يدويًا.")
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
-
+    main()
